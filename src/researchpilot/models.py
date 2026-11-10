@@ -82,6 +82,7 @@ class ReproductionReadiness(BaseModel):
     experiment: list[ReproductionItem]
     blockers: list[ReproductionItem]
     approval_actions: list[str]
+    pdf_checks: list[str] = Field(default_factory=list)
     caveats: list[str]
 
 
