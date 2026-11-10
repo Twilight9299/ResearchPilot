@@ -1,5 +1,6 @@
 import hashlib
 import os
+from decimal import Decimal, DecimalException, InvalidOperation
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -106,6 +107,83 @@ def render_readiness(readiness: ReproductionReadiness) -> None:
     st.caption("本阶段只评估复现条件，不会下载文件、运行代码或声称复现成功。")
 
 
+def render_comparison(readiness: ReproductionReadiness, document_id: str, page_count: int) -> None:
+    st.subheader("V3 实验记录与指标对照")
+    st.caption("根据复现评估整理计划，记录已完成实验的实测值。")
+    experiment_notes = [
+        f"- {item.name}（PDF 第 {'、'.join(map(str, item.pages))} 页）"
+        for item in readiness.experiment
+        if item.pages
+    ]
+    draft = "\n".join(
+        [
+            "## 验证目标",
+            "填写要验证的论文结论。",
+            "## 所需材料与待核查条件",
+            *[f"- {item.name}" for item in readiness.resources + readiness.blockers],
+            "## 论文中的实验与指标",
+            *experiment_notes,
+            "## 停止条件",
+            "数据划分、指标定义或单位无法对齐时，记录差异并暂停对照。",
+        ]
+    )
+    plan = st.text_area("实验计划（可编辑）", value=draft, key=f"v3-plan-{document_id}")
+    metric = st.text_input("指标名称及单位", key=f"v3-metric-{document_id}")
+    page = st.number_input(
+        "论文指标所在 PDF 页码",
+        min_value=1,
+        max_value=page_count,
+        step=1,
+        key=f"v3-page-{document_id}",
+    )
+    paper_value = st.text_input("论文报告值", key=f"v3-paper-{document_id}")
+    measured_value = st.text_input("实测值", key=f"v3-measured-{document_id}")
+    notes = st.text_area("实测来源与条件差异", key=f"v3-notes-{document_id}")
+
+    if not all(value.strip() for value in (metric, paper_value, measured_value)):
+        return
+    comparison_key = hashlib.sha256(
+        repr((document_id, metric, page, paper_value, measured_value, notes)).encode()
+    ).hexdigest()
+    comparable = st.checkbox(
+        "已核对数据划分、指标定义和单位，可以直接比较",
+        key=f"v3-comparable-{comparison_key}",
+    )
+    try:
+        paper_number, measured_number = (Decimal(value.strip()) for value in (
+            paper_value, measured_value
+        ))
+        if not paper_number.is_finite() or not measured_number.is_finite():
+            raise InvalidOperation
+        delta = measured_number - paper_number if comparable else None
+    except DecimalException:
+        st.error("请输入有限数值，单位写在指标名称里。")
+        return
+
+    comparison = (
+        f"实测值减论文值：{delta}（沿用输入单位）"
+        if delta is not None
+        else "待核对，暂不计算差值。"
+    )
+    st.text(comparison)
+    report = "\n".join(
+        [
+            "# 实验指标对照",
+            f"文档编号：{document_id}",
+            "",
+            plan,
+            "",
+            "## 手动录入的对照结果",
+            f"- 指标：{metric}",
+            f"- 论文值：{paper_number}（PDF 第 {page} 页，用户填写）",
+            f"- 实测值：{measured_number}（用户填写）",
+            f"- {comparison}",
+            f"- 实测来源与条件差异：{notes.strip() or '未填写'}",
+        ]
+    )
+    st.download_button("导出 Markdown 对照报告", report, "metric-comparison.md", "text/markdown")
+
+
 with st.sidebar:
     st.header("模型设置")
     environment_key = os.getenv("OPENAI_API_KEY", "")
@@ -120,7 +198,8 @@ with st.sidebar:
     st.divider()
     st.caption("V1：PDF 文本提取、页码证据、论文问答、结构化分析。")
     st.caption("V2 阶段 1：复现资源识别与条件评估，不执行下载或实验。")
-    st.caption("尚未实现：OCR、沙箱实验、结果验证、完整报告导出。")
+    st.caption("V3：可编辑实验计划、手动指标对照与 Markdown 导出。")
+    st.caption("尚未实现：OCR、沙箱实验、自动结果验证。")
 
 st.title("🔬 ResearchPilot")
 st.write("上传论文，获得可追溯到 PDF 页码的问答与结构化研究分析。")
@@ -188,7 +267,7 @@ if run:
         if mode == ResearchMode.AUTOMATIC:
             render_analysis(result["analysis"])
         elif mode == ResearchMode.REPRODUCTION:
-            render_readiness(result["readiness"])
+            st.session_state["readiness_result"] = (document_id, result["readiness"])
         else:
             st.markdown("### 回答")
             st.write(result["answer"].answer)
@@ -198,10 +277,14 @@ if run:
         with st.expander("技术详情"):
             st.code(f"{type(exc).__name__}: {exc}")
 
+saved_readiness = st.session_state.get("readiness_result")
+if mode == ResearchMode.REPRODUCTION and saved_readiness and saved_readiness[0] == document_id:
+    render_readiness(saved_readiness[1])
+    render_comparison(saved_readiness[1], document_id, len(pages))
+
 st.divider()
 with st.expander("后续能力路线图"):
     st.write("以下能力仅为预留，当前版本不会假装执行：")
     st.checkbox("查找或生成算法复现代码", disabled=True)
     st.checkbox("在隔离沙箱中运行实验", disabled=True)
-    st.checkbox("对照论文结果进行验证", disabled=True)
-    st.checkbox("导出可复现研究报告", disabled=True)
+    st.checkbox("自动验证实验结果", disabled=True)
