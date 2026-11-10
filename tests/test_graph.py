@@ -6,9 +6,28 @@ from pydantic import PrivateAttr
 from researchpilot.graph import (
     _parse_paper_analysis,
     _parse_reproduction_readiness,
+    _reproduction_context,
     build_research_graph,
 )
 from researchpilot.models import PaperChunk, ResearchMode, ResearchRequest
+
+
+def test_reproduction_context_keeps_table_rows_and_bibliography() -> None:
+    chunks = [
+        PaperChunk(chunk_id=f"p{page}-c1", page_number=page, text="Training and evaluation.")
+        for page in range(1, 31)
+    ]
+    chunks.extend(
+        [
+            PaperChunk(chunk_id="table-heading", page_number=31, text="Table 1. Model settings"),
+            PaperChunk(chunk_id="table-rows", page_number=31, text="max depth: 5"),
+            PaperChunk(chunk_id="bibliography", page_number=32, text="[21] Dataset paper title"),
+        ]
+    )
+
+    selected = {chunk.chunk_id for chunk in _reproduction_context(chunks)}
+
+    assert {"table-heading", "table-rows", "bibliography"} <= selected
 
 ANALYSIS_JSON = """
 {
