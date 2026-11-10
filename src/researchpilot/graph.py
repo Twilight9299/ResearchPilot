@@ -11,8 +11,10 @@ from researchpilot.models import (
     AnalysisItem,
     AnswerResult,
     Evidence,
+    EvidenceType,
     PaperAnalysis,
     PaperChunk,
+    ReadinessStatus,
     ReproductionItem,
     ReproductionReadiness,
     ResearchMode,
@@ -150,21 +152,68 @@ def _parse_reproduction_readiness(content: object) -> ReproductionReadiness:
         raise ValueError("模型返回的复现条件评估不符合预期格式。") from exc
 
 
+RESOURCE_EVIDENCE_PATTERN = re.compile(
+    r"(?im)^\s*(?:references|bibliography|参考文献)\s*$"
+    r"|^\s*(?:\[\d+\]|\d{1,3}\.)\s+[^\n]+"
+    r"|(?:data|code|artifact) availability|availability of (?:data|code)"
+    r"|supplementary materials?|https?://(?:www\.)?github\.com/|数据可用性|代码可用性"
+)
+TABLE_PATTERN = re.compile(r"(?im)^\s*(?:table\s*\d+|表\s*\d+)\b")
+
+
+def _reproduction_context(chunks: list[PaperChunk]) -> list[PaperChunk]:
+    query = (
+        "source code repository dataset implementation environment hardware "
+        "hyperparameters training evaluation metrics supplementary reproducibility"
+    )
+    primary = retrieve_chunks(query, chunks, limit=10)
+    tables = []
+    for index, chunk in enumerate(chunks):
+        if TABLE_PATTERN.search(chunk.text):
+            tables.append(chunk)
+            if index + 1 < len(chunks) and chunks[index + 1].page_number == chunk.page_number:
+                tables.append(chunks[index + 1])
+    tables = _merge_context(tables, [], limit=5)
+    resources = [chunk for chunk in chunks if RESOURCE_EVIDENCE_PATTERN.search(chunk.text)][:8]
+    return _merge_context(
+        tables + resources + primary, select_analysis_chunks(chunks), limit=24
+    )
+
+
 def _sanitize_reproduction_readiness(
     readiness: ReproductionReadiness, chunks: list[PaperChunk]
 ) -> ReproductionReadiness:
     allowed_pages = {chunk.page_number for chunk in chunks}
 
     def sanitize_items(items: list[ReproductionItem]) -> list[ReproductionItem]:
-        return [
-            item.model_copy(
-                update={"pages": sorted({page for page in item.pages if page in allowed_pages})}
-            )
-            for item in items
-        ]
+        sanitized = []
+        for item in items:
+            pages = sorted({page for page in item.pages if page in allowed_pages})
+            updates = {"pages": pages}
+            if item.category.strip().lower() in {"data", "dataset"}:
+                if item.status == ReadinessStatus.AVAILABLE and not item.url.strip():
+                    updates.update(status=ReadinessStatus.UNCLEAR)
+            if not pages or item.evidence_type == EvidenceType.INFERENCE:
+                updates.update(evidence_type=EvidenceType.INFERENCE, pages=[])
+                if item.status in (ReadinessStatus.MISSING, ReadinessStatus.AVAILABLE):
+                    updates.update(
+                        status=ReadinessStatus.UNCLEAR,
+                        details="当前摘录中未找到足以确认该项状态的依据，需进一步核查。",
+                        url="",
+                    )
+            sanitized.append(item.model_copy(update=updates))
+        return sanitized
 
     return readiness.model_copy(
         update={
+            **(
+                {
+                    "overall_status": ReadinessStatus.UNCLEAR,
+                    "summary": "当前摘录不足以确认复现所需条件是否齐全，请核查下列条目。",
+                }
+                if readiness.overall_status == ReadinessStatus.MISSING
+                else {}
+            ),
             "resources": sanitize_items(readiness.resources),
             "environment": sanitize_items(readiness.environment),
             "experiment": sanitize_items(readiness.experiment),
@@ -179,14 +228,7 @@ def build_research_graph(model: BaseChatModel):
         if request.mode == ResearchMode.AUTOMATIC:
             context = select_analysis_chunks(state["chunks"])
         elif request.mode == ResearchMode.REPRODUCTION:
-            query = (
-                "source code github repository dataset data availability implementation "
-                "dependencies environment hardware hyperparameters training evaluation metrics "
-                "supplementary material reproducibility"
-            )
-            primary = retrieve_chunks(query, state["chunks"], limit=12)
-            supplementary = select_analysis_chunks(state["chunks"], limit=12)
-            context = _merge_context(primary, supplementary, limit=20)
+            context = _reproduction_context(state["chunks"])
         else:
             expanded_query = _expand_search_query(model, request.question)
             primary = retrieve_chunks(expanded_query, state["chunks"], limit=8)
@@ -252,9 +294,18 @@ def build_research_graph(model: BaseChatModel):
                         "checkpoints, hardware, parameters, training procedures, and evaluation "
                         "metrics. Use evidence_type='paper' for statements directly supported by "
                         "the paper and cite exact PDF pages. Use evidence_type='inference' only "
-                        "for cautious missing-or-unclear assessments and do not invent URLs, "
-                        "resources, commands, or results. Set approval_required=true for any later "
-                        "download or external action. Reply in concise Chinese. Return only one "
+                        "for cautious unclear assessments. When excerpts omit a detail, set "
+                        "status='unclear' and say it was not found in the excerpts. Use "
+                        "status='missing' only if the paper explicitly confirms absence. "
+                        "Use overall_status='unclear' when information is insufficient. "
+                        "For cited datasets, report the matching bibliography title and its "
+                        "PDF page if present. If access is unclear, use status='unclear' even "
+                        "if the paper describes the dataset as public. Read table rows as "
+                        "evidence when present. Put checks within the uploaded PDF in pdf_checks "
+                        "and only external actions in approval_actions. "
+                        "distinguish identifying a source from confirming access. Never invent "
+                        "URLs, resources, commands, or results. Set approval_required=true for any "
+                        "later download or external action. Reply in concise Chinese. Return one "
                         "valid JSON object without Markdown fences or commentary. The JSON must "
                         f"follow this schema exactly: {schema}"
                     )
