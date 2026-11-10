@@ -198,3 +198,4 @@ def test_reproduction_readiness_filters_invalid_pages() -> None:
 
     assert result["readiness"].resources[0].pages == [9]
     assert result["readiness"].blockers[0].pages == []
+    assert result["readiness"].blockers[0].status == "unclear"
