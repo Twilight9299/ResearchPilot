@@ -11,8 +11,12 @@ from researchpilot.models import (
     AnalysisItem,
     AnswerResult,
     Evidence,
+    EvidenceType,
     PaperAnalysis,
     PaperChunk,
+    ReadinessStatus,
+    ReproductionItem,
+    ReproductionReadiness,
     ResearchMode,
     ResearchRequest,
 )
@@ -25,6 +29,7 @@ class ResearchState(TypedDict, total=False):
     context: list[PaperChunk]
     answer: AnswerResult
     analysis: PaperAnalysis
+    readiness: ReproductionReadiness
 
 
 def format_context(chunks: list[PaperChunk]) -> str:
@@ -130,11 +135,100 @@ def _parse_paper_analysis(content: object) -> PaperAnalysis:
         raise ValueError("模型返回的结构化分析不符合预期格式。") from exc
 
 
+def _parse_reproduction_readiness(content: object) -> ReproductionReadiness:
+    text = str(content).strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        text = "\n".join(lines[1:-1]).strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end < start:
+        raise ValueError("模型未返回可解析的复现条件 JSON。")
+
+    try:
+        return ReproductionReadiness.model_validate_json(text[start : end + 1])
+    except ValueError as exc:
+        raise ValueError("模型返回的复现条件评估不符合预期格式。") from exc
+
+
+RESOURCE_EVIDENCE_PATTERN = re.compile(
+    r"(?im)^\s*(?:references|bibliography|参考文献)\s*$"
+    r"|^\s*(?:\[\d+\]|\d{1,3}\.)\s+[^\n]+"
+    r"|(?:data|code|artifact) availability|availability of (?:data|code)"
+    r"|supplementary materials?|https?://(?:www\.)?github\.com/|数据可用性|代码可用性"
+)
+TABLE_PATTERN = re.compile(r"(?im)^\s*(?:table\s*\d+|表\s*\d+)\b")
+
+
+def _reproduction_context(chunks: list[PaperChunk]) -> list[PaperChunk]:
+    query = (
+        "source code repository dataset implementation environment hardware "
+        "hyperparameters training evaluation metrics supplementary reproducibility"
+    )
+    primary = retrieve_chunks(query, chunks, limit=10)
+    tables = []
+    for index, chunk in enumerate(chunks):
+        if TABLE_PATTERN.search(chunk.text):
+            tables.append(chunk)
+            if index + 1 < len(chunks) and chunks[index + 1].page_number == chunk.page_number:
+                tables.append(chunks[index + 1])
+    tables = _merge_context(tables, [], limit=5)
+    resources = [chunk for chunk in chunks if RESOURCE_EVIDENCE_PATTERN.search(chunk.text)][:8]
+    return _merge_context(
+        tables + resources + primary, select_analysis_chunks(chunks), limit=24
+    )
+
+
+def _sanitize_reproduction_readiness(
+    readiness: ReproductionReadiness, chunks: list[PaperChunk]
+) -> ReproductionReadiness:
+    allowed_pages = {chunk.page_number for chunk in chunks}
+
+    def sanitize_items(items: list[ReproductionItem]) -> list[ReproductionItem]:
+        sanitized = []
+        for item in items:
+            pages = sorted({page for page in item.pages if page in allowed_pages})
+            updates = {"pages": pages}
+            if item.category.strip().lower() in {"data", "dataset"}:
+                if item.status == ReadinessStatus.AVAILABLE and not item.url.strip():
+                    updates.update(status=ReadinessStatus.UNCLEAR)
+            if not pages or item.evidence_type == EvidenceType.INFERENCE:
+                updates.update(evidence_type=EvidenceType.INFERENCE, pages=[])
+                if item.status in (ReadinessStatus.MISSING, ReadinessStatus.AVAILABLE):
+                    updates.update(
+                        status=ReadinessStatus.UNCLEAR,
+                        details="当前摘录中未找到足以确认该项状态的依据，需进一步核查。",
+                        url="",
+                    )
+            sanitized.append(item.model_copy(update=updates))
+        return sanitized
+
+    return readiness.model_copy(
+        update={
+            **(
+                {
+                    "overall_status": ReadinessStatus.UNCLEAR,
+                    "summary": "当前摘录不足以确认复现所需条件是否齐全，请核查下列条目。",
+                }
+                if readiness.overall_status == ReadinessStatus.MISSING
+                else {}
+            ),
+            "resources": sanitize_items(readiness.resources),
+            "environment": sanitize_items(readiness.environment),
+            "experiment": sanitize_items(readiness.experiment),
+            "blockers": sanitize_items(readiness.blockers),
+        }
+    )
+
+
 def build_research_graph(model: BaseChatModel):
     def retrieve(state: ResearchState) -> ResearchState:
         request = state["request"]
         if request.mode == ResearchMode.AUTOMATIC:
             context = select_analysis_chunks(state["chunks"])
+        elif request.mode == ResearchMode.REPRODUCTION:
+            context = _reproduction_context(state["chunks"])
         else:
             expanded_query = _expand_search_query(model, request.question)
             primary = retrieve_chunks(expanded_query, state["chunks"], limit=8)
@@ -188,17 +282,70 @@ def build_research_graph(model: BaseChatModel):
         analysis = _parse_paper_analysis(response.content)
         return {"analysis": _sanitize_analysis(analysis, context)}
 
+    def assess_reproduction(state: ResearchState) -> ResearchState:
+        context = state["context"]
+        schema = json.dumps(ReproductionReadiness.model_json_schema(), ensure_ascii=False)
+        response = model.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "Assess reproduction readiness only from the supplied paper excerpts. "
+                        "Identify code, datasets, supplementary materials, dependencies, model "
+                        "checkpoints, hardware, parameters, training procedures, and evaluation "
+                        "metrics. Use evidence_type='paper' for statements directly supported by "
+                        "the paper and cite exact PDF pages. Use evidence_type='inference' only "
+                        "for cautious unclear assessments. When excerpts omit a detail, set "
+                        "status='unclear' and say it was not found in the excerpts. Use "
+                        "status='missing' only if the paper explicitly confirms absence. "
+                        "Use overall_status='unclear' when information is insufficient. "
+                        "For cited datasets, report the matching bibliography title and its "
+                        "PDF page if present. If access is unclear, use status='unclear' even "
+                        "if the paper describes the dataset as public. Read table rows as "
+                        "evidence when present. Separate the proposed method from baselines "
+                        "when listing or counting comparison methods. Use the paper's reported "
+                        "baseline count and flag any discrepancy with the visible rows. "
+                        "Put checks within the uploaded PDF in pdf_checks "
+                        "and only external actions in approval_actions. "
+                        "distinguish identifying a source from confirming access. Never invent "
+                        "URLs, resources, commands, or results. Set approval_required=true for any "
+                        "later download or external action. Reply in concise Chinese. Return one "
+                        "valid JSON object without Markdown fences or commentary. The JSON must "
+                        f"follow this schema exactly: {schema}"
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        "Create a reproduction-readiness assessment. Do not execute or download "
+                        f"anything.\n\n{format_context(context)}"
+                    )
+                ),
+            ]
+        )
+        readiness = _parse_reproduction_readiness(response.content)
+        return {"readiness": _sanitize_reproduction_readiness(readiness, context)}
+
     def route(state: ResearchState) -> str:
-        return "analyze" if state["request"].mode == ResearchMode.AUTOMATIC else "answer"
+        mode = state["request"].mode
+        if mode == ResearchMode.AUTOMATIC:
+            return "analyze"
+        if mode == ResearchMode.REPRODUCTION:
+            return "readiness"
+        return "answer"
 
     workflow = StateGraph(ResearchState)
     workflow.add_node("retrieve", retrieve)
     workflow.add_node("answer", answer_question)
     workflow.add_node("analyze", analyze_paper)
+    workflow.add_node("readiness", assess_reproduction)
     workflow.add_edge(START, "retrieve")
-    workflow.add_conditional_edges("retrieve", route, {"answer": "answer", "analyze": "analyze"})
+    workflow.add_conditional_edges(
+        "retrieve",
+        route,
+        {"answer": "answer", "analyze": "analyze", "readiness": "readiness"},
+    )
     workflow.add_edge("answer", END)
     workflow.add_edge("analyze", END)
+    workflow.add_edge("readiness", END)
     return workflow.compile()
 
 

@@ -3,8 +3,31 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import PrivateAttr
 
-from researchpilot.graph import _parse_paper_analysis, build_research_graph
+from researchpilot.graph import (
+    _parse_paper_analysis,
+    _parse_reproduction_readiness,
+    _reproduction_context,
+    build_research_graph,
+)
 from researchpilot.models import PaperChunk, ResearchMode, ResearchRequest
+
+
+def test_reproduction_context_keeps_table_rows_and_bibliography() -> None:
+    chunks = [
+        PaperChunk(chunk_id=f"p{page}-c1", page_number=page, text="Training and evaluation.")
+        for page in range(1, 31)
+    ]
+    chunks.extend(
+        [
+            PaperChunk(chunk_id="table-heading", page_number=31, text="Table 1. Model settings"),
+            PaperChunk(chunk_id="table-rows", page_number=31, text="max depth: 5"),
+            PaperChunk(chunk_id="bibliography", page_number=32, text="[21] Dataset paper title"),
+        ]
+    )
+
+    selected = {chunk.chunk_id for chunk in _reproduction_context(chunks)}
+
+    assert {"table-heading", "table-rows", "bibliography"} <= selected
 
 ANALYSIS_JSON = """
 {
@@ -15,6 +38,53 @@ ANALYSIS_JSON = """
   "contributions": {"finding": "主要贡献", "pages": [2]},
   "limitations": {"finding": "研究局限", "pages": [99]},
   "future_work": {"finding": "未来方向", "pages": [2]}
+}
+"""
+
+READINESS_JSON = """
+{
+  "title": "Example paper",
+  "overall_status": "unclear",
+  "summary": "数据可用，但代码与环境信息不完整。",
+  "resources": [
+    {
+      "category": "data",
+      "name": "Public dataset",
+      "status": "available",
+      "evidence_type": "paper",
+      "details": "The paper describes a public dataset.",
+      "pages": [9],
+      "url": "",
+      "approval_required": true
+    }
+  ],
+  "environment": [
+    {
+      "category": "hardware",
+      "name": "GPU",
+      "status": "unclear",
+      "evidence_type": "inference",
+      "details": "GPU requirements are not stated in the excerpts.",
+      "pages": [],
+      "url": "",
+      "approval_required": false
+    }
+  ],
+  "experiment": [],
+  "blockers": [
+    {
+      "category": "code",
+      "name": "Official implementation",
+      "status": "missing",
+      "evidence_type": "inference",
+      "details": "No repository is stated in the excerpts.",
+      "pages": [99],
+      "url": "",
+      "approval_required": false
+    }
+  ],
+  "approval_actions": ["Download the dataset after user approval."],
+  "caveats": ["No files were downloaded or executed."]
 }
 """
 
@@ -40,6 +110,13 @@ def test_parse_paper_analysis_accepts_markdown_fenced_json() -> None:
 
     assert analysis.title == "Example paper"
     assert analysis.key_results.pages == [2]
+
+
+def test_parse_reproduction_readiness_accepts_plain_json() -> None:
+    readiness = _parse_reproduction_readiness(READINESS_JSON)
+
+    assert readiness.overall_status == "unclear"
+    assert readiness.resources[0].pages == [9]
 
 
 def test_automatic_analysis_works_without_native_response_format() -> None:
@@ -118,3 +195,26 @@ def test_custom_question_shows_only_pages_cited_in_the_answer() -> None:
     )
 
     assert [item.page_number for item in result["answer"].evidence] == [1, 15]
+
+
+def test_reproduction_readiness_filters_invalid_pages() -> None:
+    graph = build_research_graph(FakeChatModel(responses=[READINESS_JSON]))
+    chunks = [
+        PaperChunk(chunk_id="p1-c1", page_number=1, text="Paper introduction."),
+        PaperChunk(
+            chunk_id="p9-c1",
+            page_number=9,
+            text="Dataset and evaluation details.",
+        ),
+    ]
+
+    result = graph.invoke(
+        {
+            "request": ResearchRequest(mode=ResearchMode.REPRODUCTION),
+            "chunks": chunks,
+        }
+    )
+
+    assert result["readiness"].resources[0].pages == [9]
+    assert result["readiness"].blockers[0].pages == []
+    assert result["readiness"].blockers[0].status == "unclear"
