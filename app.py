@@ -87,7 +87,12 @@ def render_readiness(readiness: ReproductionReadiness) -> None:
                 if item.approval_required:
                     st.warning("后续如需访问或下载此资源，必须先获得你的确认。")
 
-    st.markdown("### 后续需审批的操作")
+    if readiness.pdf_checks:
+        st.markdown("### PDF 内待复核")
+        for check in readiness.pdf_checks:
+            st.text(check)
+
+    st.markdown("### 外部操作（需审批）")
     if readiness.approval_actions:
         for action in readiness.approval_actions:
             st.markdown(f"- {action}")
