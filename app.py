@@ -15,6 +15,7 @@ from researchpilot.models import (
     ResearchRequest,
 )
 from researchpilot.pdf import PdfError, chunk_pages, extract_pages
+from researchpilot.results import summarize_metric_csv
 
 load_dotenv()
 
@@ -128,22 +129,70 @@ def render_comparison(readiness: ReproductionReadiness, document_id: str, page_c
         ]
     )
     plan = st.text_area("实验计划（可编辑）", value=draft, key=f"v3-plan-{document_id}")
-    metric = st.text_input("指标名称及单位", key=f"v3-metric-{document_id}")
+    metric_count = st.number_input(
+        "指标数量", min_value=1, max_value=10, step=1, key=f"v3-count-{document_id}"
+    )
+    sections = []
+    for index in range(metric_count):
+        with st.container(border=True):
+            st.markdown(f"#### 指标 {index + 1}")
+            row_key = document_id if index == 0 else f"{document_id}-{index}"
+            section = render_metric_row(row_key, page_count)
+            if section:
+                sections.append(section)
+
+    if len(sections) != metric_count:
+        st.caption("填写每项指标的名称、论文值和实测值后即可导出。")
+        return
+
+    report = "\n\n".join(
+        [
+            "# 实验指标对照",
+            f"文档编号：{document_id}",
+            plan,
+            "## 手动录入的对照结果",
+            *sections,
+        ]
+    )
+    st.download_button("导出 Markdown 对照报告", report, "metric-comparison.md", "text/markdown")
+
+
+def render_metric_row(row_key: str, page_count: int) -> str | None:
+    metric = st.text_input("指标名称及单位", key=f"v3-metric-{row_key}")
     page = st.number_input(
         "论文指标所在 PDF 页码",
         min_value=1,
         max_value=page_count,
         step=1,
-        key=f"v3-page-{document_id}",
+        key=f"v3-page-{row_key}",
     )
-    paper_value = st.text_input("论文报告值", key=f"v3-paper-{document_id}")
-    measured_value = st.text_input("实测值", key=f"v3-measured-{document_id}")
-    notes = st.text_area("实测来源与条件差异", key=f"v3-notes-{document_id}")
+    paper_value = st.text_input("论文报告值", key=f"v3-paper-{row_key}")
+    result_file = st.file_uploader(
+        "导入实测 CSV（可选）",
+        type=["csv"],
+        key=f"v4-csv-{row_key}",
+        help="UTF-8 单列 CSV，列名为 value，每行对应一次同单位的实验结果。",
+    )
+    measured_source = "用户填写"
+    if result_file is None:
+        measured_value = st.text_input("实测值", key=f"v3-measured-{row_key}")
+    else:
+        data = result_file.getvalue()
+        try:
+            mean, sample_count = summarize_metric_csv(data)
+        except ValueError as exc:
+            st.error(str(exc))
+            return None
+        measured_value = str(mean)
+        digest = hashlib.sha256(data).hexdigest()
+        measured_source = f"CSV 均值，样本数 {sample_count}，SHA-256 {digest}"
+        st.text(f"CSV 均值：{mean}，样本数：{sample_count}")
+    notes = st.text_area("实测来源与条件差异", key=f"v3-notes-{row_key}")
 
     if not all(value.strip() for value in (metric, paper_value, measured_value)):
-        return
+        return None
     comparison_key = hashlib.sha256(
-        repr((document_id, metric, page, paper_value, measured_value, notes)).encode()
+        repr((row_key, metric, page, paper_value, measured_value, measured_source, notes)).encode()
     ).hexdigest()
     comparable = st.checkbox(
         "已核对数据划分、指标定义和单位，可以直接比较",
@@ -158,7 +207,7 @@ def render_comparison(readiness: ReproductionReadiness, document_id: str, page_c
         delta = measured_number - paper_number if comparable else None
     except DecimalException:
         st.error("请输入有限数值，单位写在指标名称里。")
-        return
+        return None
 
     comparison = (
         f"实测值减论文值：{delta}（沿用输入单位）"
@@ -166,22 +215,15 @@ def render_comparison(readiness: ReproductionReadiness, document_id: str, page_c
         else "待核对，暂不计算差值。"
     )
     st.text(comparison)
-    report = "\n".join(
+    return "\n".join(
         [
-            "# 实验指标对照",
-            f"文档编号：{document_id}",
-            "",
-            plan,
-            "",
-            "## 手动录入的对照结果",
             f"- 指标：{metric}",
             f"- 论文值：{paper_number}（PDF 第 {page} 页，用户填写）",
-            f"- 实测值：{measured_number}（用户填写）",
+            f"- 实测值：{measured_number}（{measured_source}）",
             f"- {comparison}",
             f"- 实测来源与条件差异：{notes.strip() or '未填写'}",
         ]
     )
-    st.download_button("导出 Markdown 对照报告", report, "metric-comparison.md", "text/markdown")
 
 
 with st.sidebar:
@@ -199,6 +241,7 @@ with st.sidebar:
     st.caption("V1：PDF 文本提取、页码证据、论文问答、结构化分析。")
     st.caption("V2 阶段 1：复现资源识别与条件评估，不执行下载或实验。")
     st.caption("V3：可编辑实验计划、手动指标对照与 Markdown 导出。")
+    st.caption("V4：从本地 CSV 核算重复实验均值。")
     st.caption("尚未实现：OCR、沙箱实验、自动结果验证。")
 
 st.title("🔬 ResearchPilot")
