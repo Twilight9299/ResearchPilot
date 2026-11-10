@@ -268,17 +268,22 @@ if run:
             render_analysis(result["analysis"])
         elif mode == ResearchMode.REPRODUCTION:
             st.session_state["readiness_result"] = (document_id, result["readiness"])
+            st.session_state.pop("readiness_failure", None)
         else:
             st.markdown("### 回答")
             st.write(result["answer"].answer)
             render_sources(result["answer"].evidence)
     except Exception as exc:
+        if mode == ResearchMode.REPRODUCTION:
+            st.session_state["readiness_failure"] = document_id
         st.error("模型调用失败。请检查 API Key、模型名称、网络或兼容 API 地址。")
         with st.expander("技术详情"):
             st.code(f"{type(exc).__name__}: {exc}")
 
 saved_readiness = st.session_state.get("readiness_result")
 if mode == ResearchMode.REPRODUCTION and saved_readiness and saved_readiness[0] == document_id:
+    if st.session_state.get("readiness_failure") == document_id:
+        st.warning("最近一次评估失败。下面显示的是上一次成功的报告和实验记录。")
     render_readiness(saved_readiness[1])
     render_comparison(saved_readiness[1], document_id, len(pages))
 
